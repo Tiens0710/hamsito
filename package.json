@@ -1,0 +1,13 @@
+{
+  "name": "zalo-ai-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.mjs",
+  "scripts": {
+    "start": "node bot.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "zca-js": "^2.1.2"
+  }
+}
