@@ -9,14 +9,18 @@ dotenv.config();
 // ── Config ────────────────────────────────────────────────────────────────────
 const MIMO_API_KEY = process.env.MIMO_API_KEY || "";
 const MIMO_BASE_URL = (process.env.MIMO_BASE_URL || "https://token-plan-sgp.xiaomimimo.com/v1").replace(/\/$/, "");
-const MIMO_MODEL = process.env.MIMO_MODEL || "mimo-v2.5";
+const MIMO_MODEL = process.env.MIMO_MODEL || "mimo-v2-pro";
+const MIMO_VISION_MODEL = process.env.MIMO_VISION_MODEL || "mimo-v2.5";
 
 const GROUP_PREFIX = process.env.GROUP_PREFIX || "@bot ";
+function normalizeText(str) {
+  return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
 const BOT_MENTION_ALIASES = (process.env.BOT_MENTION_ALIASES || "hamster,commit,bot,ai")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster Ham Si Tơ. Giọng đáng yêu, dùng từ ngộ nghĩnh: 'kít kít' (cười), 'gặm gặm' (ăn), 'phù phù' (mệt). Xưng 'em', gọi người dùng là 'sen'. TRẢ LỜI NGẮN TỐI ĐA 1-2 CÂU. Không dài dòng. Thỉnh thoảng chêm emoji 🐹🌻.";
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster tên Ham Si Tơ. Nói chuyện tự nhiên như người bạn thân, vui tính, đôi khi hài hước. Xưng 'em' hoặc 'tao', gọi người dùng là 'sen' hoặc 'bạn'. CHỈ dùng từ 'kít kít' hoặc 'gặm gặm' KHI THẬT SỰ phù hợp (tối đa 1 lần/nhắn), KHÔNG lặp lại câu cửa miệng. Trả lời ngắn gọn 1-2 câu, đúng trọng tâm. Không thêm emoji quá nhiều, tối đa 1 emoji/nhắn. Nói chuyện bình thường, tự nhiên như bạn bè chat.";
 
 let BOT_UID = "";
 const SESSION_FILE = process.env.SESSION_FILE || "./data/session.json";
@@ -176,7 +180,7 @@ async function askMiMo(tid, question, senderName = "User", imageBase64 = null, i
         "Authorization": `Bearer ${MIMO_API_KEY}`,
       },
       body: JSON.stringify({
-        model: MIMO_MODEL,
+        model: imageBase64 ? MIMO_VISION_MODEL : MIMO_MODEL,
         messages: messages,
         max_tokens: 300,
       }),
@@ -306,16 +310,18 @@ async function handleMessage(api, message) {
 
   // ── GROUP ─────────────────────────────────────────────────────────────────
   if (message.type === ThreadType.Group) {
-    const rawLowerText = rawText.toLowerCase();
-    const prefix = (GROUP_PREFIX || "").trim().toLowerCase();
-    const tagIdx = prefix ? rawLowerText.indexOf(prefix) : -1;
+    const rawNorm = normalizeText(rawText);
+    const prefixNorm = normalizeText(GROUP_PREFIX || "@bot");
+    const tagIdx = rawNorm.indexOf(prefixNorm);
     let aliasTag = null;
     for (const a of BOT_MENTION_ALIASES) {
-      const re = new RegExp(`(^|\\s)@${a}(?=\\s|$)`, "i");
-      const m = rawText.match(re);
-      if (m) { aliasTag = m[0].trim(); break; }
+      const aNorm = normalizeText(a);
+      const re = new RegExp(`(^|\\s)@${aNorm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$)`, "i");
+      const m = rawNorm.match(re);
+      if (m) { aliasTag = rawText.slice(rawNorm.indexOf(m[0]), rawNorm.indexOf(m[0]) + m[0].length).trim(); break; }
     }
     const isTagged = tagIdx !== -1 || !!aliasTag;
+    console.log(`  [GROUP] isTagged=${isTagged} prefixNorm="${prefixNorm}" rawNorm="${rawNorm.slice(0, 60)}"`);
 
     if (!isTagged) {
       if (!groupBuffer.has(tid)) groupBuffer.set(tid, []);
@@ -328,10 +334,13 @@ async function handleMessage(api, message) {
     // Strip bot trigger
     let question = "";
     if (tagIdx !== -1) {
-      question = (rawText.slice(0, tagIdx) + rawText.slice(tagIdx + prefix.length)).trim();
+      const prefixLen = rawNorm.indexOf(prefixNorm) + prefixNorm.length;
+      question = (rawText.slice(0, rawNorm.indexOf(prefixNorm)) + rawText.slice(prefixLen)).trim();
     } else if (aliasTag) {
-      const escaped = aliasTag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      question = rawText.replace(new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "i"), " ").replace(/\s{2,}/g, " ").trim();
+      const idx = rawText.toLowerCase().indexOf(aliasTag.toLowerCase());
+      if (idx !== -1) {
+        question = (rawText.slice(0, idx) + rawText.slice(idx + aliasTag.length)).trim();
+      }
     }
 
     const qLower = question.toLowerCase();
@@ -351,7 +360,11 @@ async function handleMessage(api, message) {
     console.log(`  [BOT] Reply: "${reply.slice(0, 100)}"`);
     console.log(`  [BOT] ⏱️ E2E: ${e2eMs}ms`);
 
-    await api.sendMessage({ msg: reply, quote: message.data }, tid, message.type);
+    // Tag sender in reply
+    const tagText = `${sender} `;
+    const fullReply = tagText + reply;
+    const mentions = [{ uid: senderUid, pos: 0, len: sender.length }];
+    await api.sendMessage({ msg: fullReply, mentions, quote: message.data }, tid, message.type);
     return;
   }
 
