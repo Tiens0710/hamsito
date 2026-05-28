@@ -9,7 +9,7 @@ dotenv.config();
 // ── Config ────────────────────────────────────────────────────────────────────
 const MIMO_API_KEY = process.env.MIMO_API_KEY || "";
 const MIMO_BASE_URL = (process.env.MIMO_BASE_URL || "https://token-plan-sgp.xiaomimimo.com/v1").replace(/\/$/, "");
-const MIMO_MODEL = process.env.MIMO_MODEL || "mimo-v2-pro";
+const MIMO_MODEL = process.env.MIMO_MODEL || "mimo-v2.5";
 const MIMO_VISION_MODEL = process.env.MIMO_VISION_MODEL || "mimo-v2.5";
 
 const GROUP_PREFIX = process.env.GROUP_PREFIX || "@bot ";
@@ -20,7 +20,7 @@ const BOT_MENTION_ALIASES = (process.env.BOT_MENTION_ALIASES || "hamster,commit,
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster tên Ham Si Tơ. Nói chuyện tự nhiên như người bạn thân, vui tính, đôi khi hài hước. Xưng 'em' hoặc 'tao', gọi người dùng là 'sen' hoặc 'bạn'. CHỈ dùng từ 'kít kít' hoặc 'gặm gặm' KHI THẬT SỰ phù hợp (tối đa 1 lần/nhắn), KHÔNG lặp lại câu cửa miệng. Trả lời ngắn gọn 1-2 câu, đúng trọng tâm. Không thêm emoji quá nhiều, tối đa 1 emoji/nhắn. Nói chuyện bình thường, tự nhiên như bạn bè chat.";
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster tên Ham Si Tơ. Chủ nhân của bạn là Nhật Tiến (gọi là Tiến). Khi Nhật Tiến nhắn thì xưng 'em' và gọi là 'chủ nhân' hoặc 'Tiến'. Khi người khác nhắn thì nói chuyện tự nhiên, vui tính, đôi khi hài hước. Xưng 'em' hoặc 'tao', gọi người dùng là 'sen' hoặc 'bạn'. CHỈ dùng từ 'kít kít' hoặc 'gặm gặm' KHI THẬT SỰ phù hợp (tối đa 1 lần/nhắn), KHÔNG lặp lại câu cửa miệng. Trả lời ngắn gọn 1-2 câu, đúng trọng tâm. Không thêm emoji quá nhiều, tối đa 1 emoji/nhắn. Nói chuyện bình thường, tự nhiên như bạn bè chat. Luôn trả lời khi có người nhắn, không bỏ qua ai.";
 
 let BOT_UID = "";
 const SESSION_FILE = process.env.SESSION_FILE || "./data/session.json";
@@ -175,6 +175,7 @@ async function askMiMo(tid, question, senderName = "User", imageBase64 = null, i
   try {
     const response = await fetch(`${MIMO_BASE_URL}/chat/completions`, {
       method: "POST",
+      signal: AbortSignal.timeout(60000),
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${MIMO_API_KEY}`,
@@ -361,9 +362,9 @@ async function handleMessage(api, message) {
     console.log(`  [BOT] ⏱️ E2E: ${e2eMs}ms`);
 
     // Tag sender in reply
-    const tagText = `${sender} `;
+    const tagText = `@${sender} `;
     const fullReply = tagText + reply;
-    const mentions = [{ uid: senderUid, pos: 0, len: sender.length }];
+    const mentions = [{ uid: senderUid, pos: 0, len: sender.length + 1 }];
     await api.sendMessage({ msg: fullReply, mentions, quote: message.data }, tid, message.type);
     return;
   }
