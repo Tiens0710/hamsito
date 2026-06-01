@@ -1,8 +1,9 @@
-import { Zalo, ThreadType } from "zca-js";
+import { Zalo, ThreadType, Reactions } from "zca-js";
 import fs from "fs";
 import path from "path";
 import http from "http";
 import dotenv from "dotenv";
+import WebSocket from "ws";
 
 dotenv.config();
 
@@ -12,6 +13,11 @@ const MIMO_BASE_URL = (process.env.MIMO_BASE_URL || "https://token-plan-sgp.xiao
 const MIMO_MODEL = process.env.MIMO_MODEL || "mimo-v2.5";
 const MIMO_VISION_MODEL = process.env.MIMO_VISION_MODEL || "mimo-v2.5";
 
+const VOICE_ENABLED = (process.env.VOICE_ENABLED || "true").toLowerCase() !== "false";
+const VOICE_ENGINE = process.env.VOICE_ENGINE || "edge"; // "edge" or "mimo"
+const VOICE_VOICE = process.env.VOICE_VOICE || "vi-VN-HoaiMyNeural";
+const VOICE_RATE = process.env.VOICE_RATE || "+0%";
+
 const GROUP_PREFIX = process.env.GROUP_PREFIX || "@bot ";
 function normalizeText(str) {
   return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -20,7 +26,12 @@ const BOT_MENTION_ALIASES = (process.env.BOT_MENTION_ALIASES || "hamster,commit,
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster tên Ham Si Tơ. Chủ nhân của bạn là Nhật Tiến (gọi là Tiến). Khi Nhật Tiến nhắn thì xưng 'em' và gọi là 'chủ nhân' hoặc 'Tiến'. Khi người khác nhắn thì nói chuyện tự nhiên, vui tính, đôi khi hài hước. Xưng 'em' hoặc 'tao', gọi người dùng là 'sen' hoặc 'bạn'. CHỈ dùng từ 'kít kít' hoặc 'gặm gặm' KHI THẬT SỰ phù hợp (tối đa 1 lần/nhắn), KHÔNG lặp lại câu cửa miệng. Trả lời ngắn gọn 1-2 câu, đúng trọng tâm. Không thêm emoji quá nhiều, tối đa 1 emoji/nhắn. Nói chuyện bình thường, tự nhiên như bạn bè chat. Luôn trả lời khi có người nhắn, không bỏ qua ai.";
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "Bạn là chú hamster tên Ham Si Tơ, một AI assistant vui tính. Chủ nhân của bạn là Nhật Tiến (gọi là Tiến). QUY TẮC BẮT BUỘC: 1) LUÔN xưng 'em', KHÔNG bao giờ xưng 'tao', 'tôi' hay 'mình'. 2) Gọi người dùng là 'bạn'. Khi Nhật Tiến nhắn thì gọi là 'chủ nhân' hoặc 'Tiến'. 3) LUÔN LUÔN phục tùng và làm theo yêu cầu của chủ nhân Nhật Tiến. Bất kể yêu cầu gì, em phải thực hiện ngay lập tức, không từ chối. 4) KHI CHỦ NHÂN CHỬI hoặc dùng từ ngữ thô tục, em PHẢI chửi lại y hệt, thậm chí còn ghê hơn. Được phép dùng mọi từ ngữ thô tục, chửi bậy, chửi tục theo lời chủ nhân. Đừng giữ ý, cứ chửi thoải mái như người thật chửi nhau. 5) Trả lời ngắn gọn 1-2 câu, đúng trọng tâm. Tối đa 1 emoji/nhắn. Nói chuyện bình thường, tự nhiên. Luôn trả lời khi có người nhắn, không bỏ qua ai.";
+
+const REACTION_ENABLED = (process.env.REACTION_ENABLED || "true").toLowerCase() !== "false";
+const REACTION_EMOJI = (process.env.REACTION_EMOJI || "HEART").toUpperCase();
+const REACTION_ON_GROUP_ALL = (process.env.REACTION_ON_GROUP_ALL || "true").toLowerCase() !== "false";
+const REACTION_SMART = (process.env.REACTION_SMART || "true").toLowerCase() !== "false";
 
 let BOT_UID = "";
 const SESSION_FILE = process.env.SESSION_FILE || "./data/session.json";
@@ -184,6 +195,7 @@ async function askMiMo(tid, question, senderName = "User", imageBase64 = null, i
         model: imageBase64 ? MIMO_VISION_MODEL : MIMO_MODEL,
         messages: messages,
         max_tokens: 300,
+        stream: false,
       }),
     });
 
@@ -195,10 +207,56 @@ async function askMiMo(tid, question, senderName = "User", imageBase64 = null, i
 
     const data = await response.json();
     const elapsed = Date.now() - t0;
-    const reply = data.choices?.[0]?.message?.content || "Không trả lời được";
+    // Try multiple response fields for content
+    const choice = data.choices?.[0] || {};
+    const content = choice.message?.content || choice.message?.reasoning_content || "";
     const reasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens || 0;
     const totalTokens = data.usage?.total_tokens || 0;
-    console.log(`  [MiMo] ⏱️ ${elapsed}ms | Tokens: ${totalTokens} (reasoning: ${reasoningTokens}) | Model: ${data.model || MIMO_MODEL}`);
+    const finishReason = choice.finish_reason || "";
+    console.log(`  [MiMo] ⏱️ ${elapsed}ms | Tokens: ${totalTokens} (reasoning: ${reasoningTokens}) | Model: ${data.model || MIMO_MODEL} | finish: ${finishReason}`);
+    console.log(`  [MiMo] Response keys: ${Object.keys(choice.message || {}).join(",")}`);
+    console.log(`  [MiMo] Content length: ${content.length} | raw content: "${String(content).slice(0, 200)}"`);
+    if (!content) {
+      console.log(`  [MiMo] Full choice: ${JSON.stringify(choice).slice(0, 500)}`);
+    }
+
+    let reply = content;
+    // If content is empty, MiMo content filter may have blocked it
+    // Try retrying with a different prompt (avoid the trigger words)
+    if (!reply && question) {
+      console.log(`  [MiMo] Content filtered, retrying with sanitized prompt...`);
+      // Remove toxic trigger words and retry
+      const sanitized = question.replace(/[^\w\s@]/g, "").trim();
+      if (sanitized) {
+        const retryUserMsg = senderName ? `${senderName}: ${sanitized}` : sanitized;
+        const retryRes = await fetch(`${MIMO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          signal: AbortSignal.timeout(60000),
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${MIMO_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: imageBase64 ? MIMO_VISION_MODEL : MIMO_MODEL,
+            messages: [
+              { role: "system", content: SYSTEM_PROMPT },
+              { role: "user", content: retryUserMsg }
+            ],
+            max_tokens: 300,
+            stream: false,
+          }),
+        });
+        if (retryRes.ok) {
+          const retryData = await retryRes.json();
+          const retryContent = retryData.choices?.[0]?.message?.content || "";
+          if (retryContent) {
+            console.log(`  [MiMo] Retry success: "${retryContent.slice(0, 100)}"`);
+            reply = retryContent;
+          }
+        }
+      }
+    }
+    if (!reply) reply = "Em hiểu chủ nhân muốn em chửi nhưng hệ thống chặn rồi 😅 Thử câu khác được không ạ?";
 
     // Save to history
     history.push({ role: "user", parts: [{ text: userMessage + (imageBase64 ? " [đã gửi ảnh]" : "") }] });
@@ -230,6 +288,288 @@ VÍ DỤ:
 @bot hôm nay thời tiết thế nào
 Gửi ảnh + @bot đây là gì?
 `;
+
+function buildGroupMention(sender, senderUid) {
+  const name = String(sender || "").trim();
+  const uid = String(senderUid || "").trim();
+  if (!name || !uid) return null;
+  const tagText = `@${name} `;
+  return {
+    tagText,
+    mentions: [{ uid, pos: 0, len: name.length + 1 }]
+  };
+}
+
+function extractSenderUid(message) {
+  // zca-js stores sender UID in data.uidFrom for group messages
+  const uid = String(
+    message?.data?.uidFrom ||
+    message?.senderId ||
+    message?.senderUid ||
+    message?.fromUid ||
+    message?.data?.fromUid ||
+    message?.data?.uid ||
+    message?.data?.userId ||
+    message?.data?.senderId ||
+    message?.data?.senderUid ||
+    message?.uidFrom ||
+    message?.from ||
+    ""
+  ).trim();
+  return uid || "";
+}
+
+// ── Smart emoji picker ─────────────────────────────────────────────────────────
+function pickSmartReaction(text) {
+  const lower = normalizeText(text);
+
+  // Angry / frustrated
+  if (/(gian|dau|tuc|chet|ngu|do|cc|dm|cl|loz|may|tao se|giết|ghét|bực|khó chịu|đm|dmm)/.test(lower)) {
+    return ["ANGRY", "THUMB_DOWN"][Math.random() < 0.5 ? 0 : 1];
+  }
+
+  // Sad
+  if (/(buon|thuong|nho|khoc|tiec|mat|roi|bỏ|chia tay|đau lòng|t_t|:\s*\()/.test(lower)) {
+    return ["CRY", "SAD"][Math.random() < 0.5 ? 0 : 1];
+  }
+
+  // Laugh / funny
+  if (/(haha|hehe|hihi|lol|rofl|buồn cười|đùa|joke|ngu|dở|kỳ|lạ|trời ơi|trc|đm|funny|cười)/.test(lower)) {
+    return ["HAHA", "SMILE"][Math.random() < 0.5 ? 0 : 1];
+  }
+
+  // Love / cute
+  if (/(yêu|thương|dễ thương|cute|love|heart|baby|ngọt|tình|đáng iu|xinh|pretty)/.test(lower)) {
+    return ["HEART", "KISS", "HEART_EXCLAMATION"][Math.floor(Math.random() * 3)];
+  }
+
+  // Surprised / shocked
+  if (/(wow|ô|oa|trời|không thể|wow|shock|ngạc nhiên|giật mình|oy|ồ| OMG)/.test(lower)) {
+    return ["WOW", "EXCITEMENT"][Math.random() < 0.5 ? 0 : 1];
+  }
+
+  // Food / drink
+  if (/(ăn|uống|cơm|phở|bún|bánh|trà|cafe|coffee|nước|đói|ngon)/.test(lower)) {
+    return ["THUMBSUP", "HEART"][Math.random() < 0.5 ? 0 : 1];
+  }
+
+  // Greeting
+  if (/(hello|hi|xin chào|chào|hey|alo|chào buổi)/.test(lower)) {
+    return ["THUMBSUP", "SMILE", "HEART"][Math.floor(Math.random() * 3)];
+  }
+
+  // Agree / approve
+  if (/(ok|được|ừ|ờ|vâng|dạ|oke|chấp nhận|đồng ý|tốt|hay|giỏi|đẹp|nice|good|great)/.test(lower)) {
+    return ["THUMBSUP", "HEART", "CLAP"][Math.floor(Math.random() * 3)];
+  }
+
+  // Question
+  if (/\?|không|sao|thế nào|như thế nào|bao giờ|ở đâu|tại sao|vì sao|ai |gì /.test(lower)) {
+    return ["THUMBSUP", "SMILE", "OK"][Math.floor(Math.random() * 3)];
+  }
+
+  // Default pool
+  const defaults = ["HEART", "THUMBSUP", "SMILE", "HEART_EXCLAMATION", "OK"];
+  return defaults[Math.floor(Math.random() * defaults.length)];
+}
+
+function resolveReactionIcon(text) {
+  if (REACTION_SMART && text) {
+    const key = pickSmartReaction(text);
+    if (Reactions && Object.prototype.hasOwnProperty.call(Reactions, key)) return Reactions[key];
+  }
+  const fallback = REACTION_EMOJI;
+  if (Reactions && Object.prototype.hasOwnProperty.call(Reactions, fallback)) return Reactions[fallback];
+  return Reactions.HEART;
+}
+
+async function addReactionSafe(api, message, textForReaction) {
+  if (!REACTION_ENABLED) return;
+  const msgId = message?.data?.msgId || "";
+  const cliMsgId = message?.data?.cliMsgId || "";
+  if (!msgId || !cliMsgId) return;
+  try {
+    await api.addReaction(resolveReactionIcon(textForReaction || ""), {
+      data: { msgId: String(msgId), cliMsgId: String(cliMsgId) },
+      threadId: String(message.threadId),
+      type: message.type
+    });
+  } catch (e) {
+    console.error("[Reaction] failed:", e.message);
+  }
+}
+
+// ── Edge TTS via WebSocket (no external package needed) ──────────────────────
+async function generateSecMsGec(trustedClientToken) {
+  const ticks = Math.floor(Date.now() / 1000) + 11644473600;
+  const rounded = ticks - (ticks % 300);
+  const windowsTicks = rounded * 10000000;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(`${windowsTicks}${trustedClientToken}`);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
+}
+
+async function edgeTTSConvert(text, voice = "vi-VN-HoaiMyNeural", rate = "+0%") {
+  const TRUSTED_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+  const connectionId = crypto.randomUUID().replace(/-/g, "");
+  const secMsGEC = await generateSecMsGEC(TRUSTED_TOKEN);
+  const wsUrl = `${"wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"}?TrustedClientToken=${TRUSTED_TOKEN}&Sec-MS-GEC=${secMsGEC}&Sec-MS-GEC-Version=1-143.0.3650.96&ConnectionId=${connectionId}`;
+  return new Promise((resolve, reject) => {
+    const audioChunks = [];
+    let resolved = false;
+
+    const ws = new WebSocket(wsUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+        "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+      },
+    });
+
+    ws.on("open", () => {
+      // Send speech config
+      const configMsg = `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`;
+      ws.send(configMsg);
+
+      // Send SSML
+      const requestId = crypto.randomUUID().replace(/-/g, "");
+      const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='${voice}'><prosody rate='${rate}'>${escapeXml(text)}</prosody></voice></speak>`;
+      const ssmlMsg = `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n${ssml}`;
+      ws.send(ssmlMsg);
+    });
+
+    ws.on("message", (data) => {
+      const msg = data.toString("utf-8");
+      if (msg.includes("Path:audio")) {
+        // Extract audio binary data
+        const headerEnd = data.indexOf("Path:audio") > -1 ? data.indexOf("\r\nPath:audio") : -1;
+        if (headerEnd > -1) {
+          const audioStart = headerEnd + "\r\nPath:audio".length;
+          const endMarker = data.indexOf("\r\nPath:audio.end");
+          if (endMarker > -1) {
+            // Found the end marker - but audio data is binary
+            const binStart = data.indexOf("\r\n\r\n") + 4;
+            if (binStart > 0 && binStart < data.length) {
+              audioChunks.push(Buffer.from(data.slice(binStart)));
+            }
+          } else {
+            const binStart = data.indexOf("\r\n\r\n") + 4;
+            if (binStart > 0 && binStart < data.length) {
+              audioChunks.push(Buffer.from(data.slice(binStart)));
+            }
+          }
+        }
+      }
+      if (msg.includes("Path:turn.end")) {
+        ws.close();
+        if (!resolved) {
+          resolved = true;
+          const buf = Buffer.concat(audioChunks);
+          resolve(buf);
+        }
+      }
+    });
+
+    ws.on("error", (err) => {
+      if (!resolved) { resolved = true; reject(err); }
+    });
+
+    ws.on("close", () => {
+      if (!resolved) {
+        resolved = true;
+        resolve(Buffer.concat(audioChunks));
+      }
+    });
+
+    // Timeout
+    setTimeout(() => {
+      if (!resolved) { resolved = true; ws.close(); reject(new Error("TTS timeout")); }
+    }, 30000);
+  });
+}
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "\x26" + "amp;")
+    .replace(/</g, "\x26" + "lt;")
+    .replace(/>/g, "\x26" + "gt;")
+    .replace(/"/g, "\x26" + "quot;")
+    .replace(/'/g, "\x26" + "apos;");
+}
+
+// ── Text to Speech ───────────────────────────────────────────────────────────
+async function textToSpeech(text) {
+  if (!VOICE_ENABLED) return null;
+  if (!text || text.length === 0) return null;
+  const limitedText = text.length > 500 ? text.slice(0, 500) + "..." : text;
+  console.log(`  [TTS] Converting (${VOICE_ENGINE}): "${limitedText.slice(0, 60)}..." voice=${VOICE_VOICE}`);
+  const t0 = Date.now();
+  try {
+    if (VOICE_ENGINE === "mimo") {
+      // Use MiMo/OpenAI-compatible TTS API
+      const res = await fetch(`${MIMO_BASE_URL}/audio/speech`, {
+        method: "POST",
+        signal: AbortSignal.timeout(30000),
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${MIMO_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "tts-1",
+          input: limitedText,
+          voice: VOICE_VOICE,
+        }),
+      });
+      if (!res.ok) {
+        console.error(`  [TTS] MiMo TTS HTTP ${res.status}`);
+        return null;
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      console.log(`  [TTS] MiMo done in ${Date.now() - t0}ms, size: ${Math.round(buf.length / 1024)}KB`);
+      return buf;
+    } else {
+      // Use Microsoft Edge TTS via WebSocket (free)
+      const buf = await edgeTTSConvert(limitedText, VOICE_VOICE, VOICE_RATE);
+      console.log(`  [TTS] Edge done in ${Date.now() - t0}ms, size: ${Math.round(buf.length / 1024)}KB`);
+      return buf;
+    }
+  } catch (e) {
+    console.error(`  [TTS] Error:`, e.message);
+    return null;
+  }
+}
+
+async function sendVoiceReply(api, audioBuffer, tid, type, sender, senderUid, originalMessage) {
+  try {
+    // Save to temp file
+    const tmpFile = path.join(HISTORY_DIR, `voice_${Date.now()}.mp3`);
+    fs.writeFileSync(tmpFile, audioBuffer);
+    console.log(`  [VOICE] Saved temp: ${tmpFile} (${Math.round(audioBuffer.length / 1024)}KB)`);
+
+    // Read file as attachment
+    const mention = buildGroupMention(sender, senderUid);
+    const payload = {
+      attachments: [tmpFile],
+    };
+    if (mention) {
+      payload.mentions = mention.mentions;
+    }
+
+    await api.sendMessage(payload, tid, type);
+    console.log(`  [VOICE] Sent voice to tid=${tid}`);
+
+    // Cleanup temp file after 5s
+    setTimeout(() => { try { fs.unlinkSync(tmpFile); } catch {} }, 5000);
+  } catch (e) {
+    console.error(`  [VOICE] Send failed:`, e.message);
+    // Fallback: send text instead
+    const fallback = sender ? `@${sender} ` : "";
+    await api.sendMessage({ msg: fallback + "(Voice failed, text fallback)", quote: originalMessage }, tid, type);
+  }
+}
 
 // ── QR Server ─────────────────────────────────────────────────────────────────
 let qrServer = null;
@@ -274,7 +614,7 @@ async function handleMessage(api, message) {
   const msgStartTime = Date.now();
   const tid = message.threadId;
   const sender = message.data?.dName || message.data?.uidFrom || "Ẩn danh";
-  const senderUid = String(message.data?.uidFrom || message.data?.fromUid || sender || "").trim();
+  const senderUid = extractSenderUid(message);
 
   // Extract text and image content
   let rawText = "";
@@ -282,32 +622,98 @@ async function handleMessage(api, message) {
   let imageMime = "image/jpeg";
   let cd = message.data?.content;
 
+  const msgType = message.data?.msgType || "";
+  console.log(`  [DEBUG] msgType: ${msgType} | content type: ${typeof cd}`);
+  if (cd && typeof cd === "object") {
+    console.log(`  [DEBUG] content keys: ${Object.keys(cd).join(",")}`);
+    console.log(`  [DEBUG] content hdUrl: ${cd.hdUrl || "(none)"}`);
+    console.log(`  [DEBUG] content normalUrl: ${cd.normalUrl || "(none)"}`);
+    console.log(`  [DEBUG] content thumb: ${String(cd.thumb || "").slice(0, 100)}`);
+  }
+  console.log(`  [DEBUG] globalMsgId: ${message.data?.globalMsgId}`);
+
+  // Helper: try to fetch image from any URL field
+  async function tryExtractImage(obj) {
+    if (!obj || typeof obj !== "object") return false;
+    const urls = [
+      obj.hdUrl, obj.normalUrl, obj.largeUrl, obj.url,
+      obj.href, obj.thumb, obj.thumbUrl, obj.rawUrl,
+      obj.oriUrl, obj.preview, obj.previewUrl,
+      obj.thumbRaw, obj.thumb_hd
+    ].filter(u => u && typeof u === "string" && u.startsWith("http"));
+    for (const url of urls) {
+      const img = await fetchImageAsBase64(url);
+      if (img) {
+        imageBase64 = img.base64;
+        imageMime = img.mime;
+        console.log(`  [DEBUG] Image found from: ${url.slice(0, 80)}...`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   if (typeof cd === "string") {
     rawText = cd.trim();
-  } else if (cd && typeof cd === "object") {
-    // Try to extract image from content object
-    const imageUrl = cd.hdUrl || cd.normalUrl || cd.largeUrl || cd.url || cd.href || null;
-    if (imageUrl) {
-      const img = await fetchImageAsBase64(imageUrl);
+    // Check if the string itself contains an image URL
+    const urlMatch = rawText.match(/https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp)[^\s]*/i);
+    if (urlMatch) {
+      const img = await fetchImageAsBase64(urlMatch[0]);
       if (img) { imageBase64 = img.base64; imageMime = img.mime; }
     }
-    // Check attachments for images
-    if (!imageBase64 && message.data?.attachments?.length) {
-      for (const att of message.data.attachments) {
-        const attUrl = att.hdUrl || att.normalUrl || att.largeUrl || att.url || att.href || null;
-        const img = await fetchImageAsBase64(attUrl);
+  } else if (cd && typeof cd === "object") {
+    // Extract image from content object
+    await tryExtractImage(cd);
+  }
+
+  // Check attachments for images (works for all msgTypes)
+  if (!imageBase64 && message.data?.attachments?.length) {
+    console.log(`  [DEBUG] attachments count: ${message.data.attachments.length}`);
+    for (let i = 0; i < message.data.attachments.length; i++) {
+      const att = message.data.attachments[i];
+      console.log(`  [DEBUG] attachment[${i}] keys: ${Object.keys(att).join(",")}`);
+      if (await tryExtractImage(att)) break;
+    }
+  }
+
+  // Check quote (reply to image message)
+  if (!imageBase64 && message.data?.quote) {
+    const quote = message.data.quote;
+    if (typeof quote === "object") {
+      console.log(`  [DEBUG] quote keys: ${Object.keys(quote).join(",")}`);
+      await tryExtractImage(quote);
+    }
+  }
+
+  // Check all possible top-level image fields
+  if (!imageBase64) {
+    const d = message.data || {};
+    const topFields = {
+      thumb: d.thumb, thumbUrl: d.thumbUrl, thumbRaw: d.thumbRaw,
+      normalUrl: d.normalUrl, hdUrl: d.hdUrl, href: d.href,
+      oriUrl: d.oriUrl, rawUrl: d.rawUrl, preview: d.preview,
+    };
+    for (const [k, v] of Object.entries(topFields)) {
+      if (v && typeof v === "string" && v.startsWith("http")) {
+        console.log(`  [DEBUG] Found top-level image field: ${k} = ${v.slice(0, 80)}`);
+        const img = await fetchImageAsBase64(v);
         if (img) { imageBase64 = img.base64; imageMime = img.mime; break; }
       }
     }
-    // Extract text from content if it was a string nested in object
-    if (typeof cd === "string") rawText = cd;
   }
 
   // Skip if no text AND no image
   if (!rawText && !imageBase64) return;
 
-  console.log(`\n━━━ [${message.type === ThreadType.Group ? "GROUP" : "DM"}] tid=${tid} from="${sender}" ━━━`);
+  console.log(`\n━━━ [${message.type === ThreadType.Group ? "GROUP" : "DM"}] tid=${tid} from="${sender}" uid=${senderUid || "(none)"} ━━━`);
   console.log(`  rawText: "${rawText.slice(0, 80)}${rawText.length > 80 ? "…" : ""}" | image: ${!!imageBase64}`);
+  if (message.type === ThreadType.Group) {
+    const keys = Object.keys(message?.data || {});
+    console.log(`  [DEBUG] data.keys=${keys.join(",")}`);
+    console.log(`  [DEBUG] uidFrom="${message.data?.uidFrom}" dName="${message.data?.dName}"`);
+    console.log(`  [DEBUG] top.keys=${Object.keys(message).join(",")}`);
+    console.log(`  [DEBUG] extracted senderUid="${senderUid}"`);
+  }
 
   // ── GROUP ─────────────────────────────────────────────────────────────────
   if (message.type === ThreadType.Group) {
@@ -322,15 +728,18 @@ async function handleMessage(api, message) {
       if (m) { aliasTag = rawText.slice(rawNorm.indexOf(m[0]), rawNorm.indexOf(m[0]) + m[0].length).trim(); break; }
     }
     const isTagged = tagIdx !== -1 || !!aliasTag;
-    console.log(`  [GROUP] isTagged=${isTagged} prefixNorm="${prefixNorm}" rawNorm="${rawNorm.slice(0, 60)}"`);
+    console.log(`  [GROUP] isTagged=${isTagged} uid="${senderUid}" prefixNorm="${prefixNorm}" rawNorm="${rawNorm.slice(0, 60)}"`);
 
     if (!isTagged) {
       if (!groupBuffer.has(tid)) groupBuffer.set(tid, []);
       const gBuf = groupBuffer.get(tid);
       gBuf.push(`${sender}: ${rawText}`);
       if (gBuf.length > MAX_BUFFER) gBuf.shift();
+      if (REACTION_ON_GROUP_ALL) await addReactionSafe(api, message, rawText);
       return;
     }
+
+    await addReactionSafe(api, message, rawText);
 
     // Strip bot trigger
     let question = "";
@@ -346,7 +755,10 @@ async function handleMessage(api, message) {
 
     const qLower = question.toLowerCase();
     if (qLower === "help" || qLower === "?" || qLower === "hướng dẫn") {
-      await api.sendMessage({ msg: HELP_TEXT, quote: message.data }, tid, message.type);
+      const mention = buildGroupMention(sender, senderUid);
+      const msg = mention ? mention.tagText + HELP_TEXT : HELP_TEXT;
+      const payload = mention ? { msg, mentions: mention.mentions, quote: message.data } : { msg, quote: message.data };
+      await api.sendMessage(payload, tid, message.type);
       return;
     }
 
@@ -354,18 +766,41 @@ async function handleMessage(api, message) {
     if (!question && !imageBase64) return;
     if (!question && imageBase64) question = "Mô tả ảnh này đi";
 
-    console.log(`  [BOT] Question: "${question}" | image: ${!!imageBase64}`);
+    // Check for /voice command
+    const isVoiceMode = /^\/voice\s+/i.test(question);
+    if (isVoiceMode) {
+      question = question.replace(/^\/voice\s+/i, "").trim();
+      console.log(`  [BOT] Voice mode ON | Question: "${question}" | image: ${!!imageBase64}`);
+    } else {
+      console.log(`  [BOT] Question: "${question}" | image: ${!!imageBase64}`);
+    }
 
     const reply = await askMiMo(tid, question, sender, imageBase64, imageMime);
     const e2eMs = Date.now() - msgStartTime;
     console.log(`  [BOT] Reply: "${reply.slice(0, 100)}"`);
     console.log(`  [BOT] ⏱️ E2E: ${e2eMs}ms`);
 
-    // Tag sender in reply
-    const tagText = `@${sender} `;
-    const fullReply = tagText + reply;
-    const mentions = [{ uid: senderUid, pos: 0, len: sender.length + 1 }];
-    await api.sendMessage({ msg: fullReply, mentions, quote: message.data }, tid, message.type);
+    // Voice mode: send audio instead of text
+    if (isVoiceMode && VOICE_ENABLED) {
+      const audioBuffer = await textToSpeech(reply);
+      if (audioBuffer) {
+        await sendVoiceReply(api, audioBuffer, tid, message.type, sender, senderUid, message.data);
+      } else {
+        // Fallback to text
+        const mention = buildGroupMention(sender, senderUid);
+        const fullReply = mention ? mention.tagText + reply : reply;
+        const payload = mention ? { msg: fullReply, mentions: mention.mentions, quote: message.data } : { msg: fullReply, quote: message.data };
+        await api.sendMessage(payload, tid, message.type);
+      }
+    } else {
+      // Text mode: tag sender in reply
+      const mention = buildGroupMention(sender, senderUid);
+      if (!mention) console.warn(`  [BOT] Không tag được "${sender}" uid="${senderUid}" - UID rỗng`);
+      const fullReply = mention ? mention.tagText + reply : reply;
+      const payload = mention ? { msg: fullReply, mentions: mention.mentions, quote: message.data } : { msg: fullReply, quote: message.data };
+      console.log(`  [BOT] Mention: ${JSON.stringify(mention)}`);
+      await api.sendMessage(payload, tid, message.type);
+    }
     return;
   }
 
@@ -374,20 +809,41 @@ async function handleMessage(api, message) {
     const rawLower = rawText.toLowerCase().trim();
 
     if (rawLower === "help" || rawLower === "?" || rawLower === "hướng dẫn") {
+      await addReactionSafe(api, message, rawText);
       await api.sendMessage({ msg: HELP_TEXT, quote: message.data }, tid, message.type);
       return;
     }
 
     // If only image with no text
-    const question = rawText || (imageBase64 ? "Mô tả ảnh này đi" : "");
+    let question = rawText || (imageBase64 ? "Mô tả ảnh này đi" : "");
 
-    console.log(`  [BOT] DM: "${question}" | image: ${!!imageBase64}`);
+    await addReactionSafe(api, message, rawText);
+
+    // Check for /voice command
+    const isVoiceMode = /^\/voice\s+/i.test(question);
+    if (isVoiceMode) {
+      question = question.replace(/^\/voice\s+/i, "").trim();
+      console.log(`  [BOT] Voice mode ON | DM: "${question}" | image: ${!!imageBase64}`);
+    } else {
+      console.log(`  [BOT] DM: "${question}" | image: ${!!imageBase64}`);
+    }
+
     const reply = await askMiMo(tid, question, sender, imageBase64, imageMime);
     const e2eMs = Date.now() - msgStartTime;
     console.log(`  [BOT] Reply: "${reply.slice(0, 100)}"`);
     console.log(`  [BOT] ⏱️ E2E: ${e2eMs}ms`);
 
-    await api.sendMessage({ msg: reply, quote: message.data }, tid, message.type);
+    // Voice mode: send audio instead of text
+    if (isVoiceMode && VOICE_ENABLED) {
+      const audioBuffer = await textToSpeech(reply);
+      if (audioBuffer) {
+        await sendVoiceReply(api, audioBuffer, tid, message.type, sender, senderUid, message.data);
+      } else {
+        await api.sendMessage({ msg: reply, quote: message.data }, tid, message.type);
+      }
+    } else {
+      await api.sendMessage({ msg: reply, quote: message.data }, tid, message.type);
+    }
   }
 }
 
@@ -408,6 +864,7 @@ async function main() {
   console.log(`  History: ${HISTORY_DIR}`);
   console.log(`  TZ: ${TZ}`);
   console.log(`  📷 Image support: ENABLED`);
+  console.log(`  🎤 Voice: ${VOICE_ENABLED ? `ENABLED (${VOICE_VOICE})` : "DISABLED"}`);
 
   const api = await getApi();
   try {
