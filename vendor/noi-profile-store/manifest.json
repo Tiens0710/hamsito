@@ -1,0 +1,21 @@
+{
+  "sourceRepository": "https://github.com/Tiens0710/noi-english-coach",
+  "sourceCommit": "1afdbd4957a1bf56dec90ce0ded6e24a4bfcbaf5",
+  "files": [
+    {
+      "path": "records.mjs",
+      "sourcePath": "src/learning/records.mjs",
+      "sha256": "5885e642b0311d8950604be4a832299d89017e32e8d9cfb6f99fdc512c59ef26"
+    },
+    {
+      "path": "supabase.mjs",
+      "sourcePath": "src/storage/supabase.mjs",
+      "sha256": "39289d7f207efdc2241c24aefd778aab3eadc26b086170380d2ce7c1aa2ee6d3"
+    },
+    {
+      "path": "profile-merge.mjs",
+      "sourcePath": "src/storage/profile-merge.mjs",
+      "sha256": "fc38e160987c7e69e4414c30e97f66657cdc587b1ee2570bece988f67791f696"
+    }
+  ]
+}

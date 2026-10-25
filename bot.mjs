@@ -1,6 +1,4 @@
 import { Zalo, ThreadType, Reactions } from "zca-js";
-import { coachStreamContext, readGeminiStream } from './english/gemini-streaming.mjs';
-import { setTimeout as waitForRetry } from 'node:timers/promises';
 import fs from "fs";
 import path from "path";
 import http from "http";
@@ -10,7 +8,7 @@ import WebSocket from "ws";
 import nodemailer from "nodemailer";
 import { pathToFileURL } from "node:url";
 import { ensureLearningState, ENGLISH_TRACKING_FORMAT, parseEnglishLearningReply, recordEnglishLearning, learningContext, getLearningSnapshot, reviewLearningCard } from "./english/english-learning.mjs";
-import { createSharedPairingCode, isEnglishCloudConfigured, loadEnglishCoachProfile, saveEnglishCoachProfile } from "./english/english-cloud-store.mjs";
+import { createSharedPairingCode, isEnglishCloudConfigured, loadEnglishCoachProfile, saveEnglishCoachProfile, withRevision } from "./english/english-cloud-store.mjs";
 
 dotenv.config();
 
@@ -422,7 +420,7 @@ const MAX_BUFFER = 50;
 const MAX_HISTORY = 10;
 const chatHistoryCache = new Map();
 const englishCloudWrites = new Map();
-const englishCloudSynced = new Set();
+const englishCloudBases = new Map();
 const historyCacheTouchedAt = new Map();
 const conversationDigestCache = new Map();
 const conversationDigestTouchedAt = new Map();
@@ -1188,7 +1186,6 @@ function saveEnglishProgress(memoryKey, state) {
     const file = englishProgressFile(memoryKey);
     fs.writeFileSync(`${file}.tmp`, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
     fs.renameSync(`${file}.tmp`, file);
-    if (englishCloudSynced.has(String(memoryKey))) queueEnglishCloudSave(memoryKey, state);
   } catch (e) {
     console.error("[English] Không lưu được tiến độ:", e.message);
   }
@@ -1219,16 +1216,19 @@ function importEnglishLearnerData(learnerId, data) {
   }
 }
 
-function queueEnglishCloudSave(learnerId, state = loadEnglishProgress(learnerId)) {
-  if (!isEnglishCloudConfigured()) return Promise.resolve();
-  const id = String(learnerId);
-  const historyId = englishHistoryId(id, state);
-  const payload = JSON.parse(JSON.stringify({ progress: state, history: getHistory(historyId) }));
-  const previous = englishCloudWrites.get(id) || Promise.resolve();
-  const pending = previous.catch(() => {}).then(() => saveEnglishCoachProfile(id, payload))
-    .catch(error => console.error("[English Sync] Không lưu được hồ sơ cloud:", error.message));
-  englishCloudWrites.set(id, pending);
-  return pending;
+function queueEnglishCloudSave(learnerId,state=loadEnglishProgress(learnerId)){
+ if(!isEnglishCloudConfigured())return Promise.resolve();
+ const id=String(learnerId),historyId=englishHistoryId(id,state);
+ const payload=JSON.parse(JSON.stringify({progress:state,history:getHistory(historyId)}));
+ const previous=englishCloudWrites.get(id)||Promise.resolve();
+ const pending=previous.catch(()=>{}).then(async()=>{
+  const base=englishCloudBases.get(id);
+  if(!base)throw new Error('Learner must be loaded before saving cloud progress.');
+  const saved=await saveEnglishCoachProfile(id,payload,base);
+  englishCloudBases.set(id,saved);
+  importEnglishLearnerData(id,saved);
+ });
+ englishCloudWrites.set(id,pending);return pending;
 }
 
 async function flushEnglishCloudSave(learnerId) {
@@ -1243,10 +1243,10 @@ async function syncEnglishLearnerFromCloud(learnerId) {
   try {
     const payload = await loadEnglishCoachProfile(String(learnerId));
     if (payload) importEnglishLearnerData(learnerId, payload);
-    englishCloudSynced.add(String(learnerId));
+    englishCloudBases.set(String(learnerId), payload || withRevision(exportEnglishLearnerData(learnerId), null));
     return true;
   } catch (error) {
-    englishCloudSynced.delete(String(learnerId));
+    englishCloudBases.delete(String(learnerId));
     console.error("[English Sync] Không tải được hồ sơ cloud:", error.message);
     return false;
   }
@@ -1455,8 +1455,8 @@ async function handleEnglishCommand(api, message, rawText) {
     return await handleEnglishCommandLocal(api, message, value);
   } finally {
     if (cloudReady) {
-      await queueEnglishCloudSave(memoryKey);
-      await flushEnglishCloudSave(memoryKey);
+      try { await queueEnglishCloudSave(memoryKey); await flushEnglishCloudSave(memoryKey); }
+      catch(error){await api.sendMessage({msg:error.status===409?'Hồ sơ vừa được cập nhật từ web. Nhắn /english report để nạp lại tiến độ rồi tiếp tục nhé.':'Chưa lưu được tiến độ lên cloud. Bạn kiểm tra kết nối trước khi tiếp tục nhé.',quote:message.data},message.threadId,message.type);throw error;}
     }
   }
 }
@@ -1690,7 +1690,10 @@ async function deliverScheduledVocabulary(api, fileName) {
   if (dailyVocabDeliveryLocks.has(lockKey)) return;
   dailyVocabDeliveryLocks.add(lockKey);
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const local = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const memoryKey = String(local.ownerKey || fileName.replace(/\.json$/iu, ""));
+    const cloudReady = await syncEnglishLearnerFromCloud(memoryKey);
+    const data = loadEnglishProgress(memoryKey);
     const state = { ...emptyEnglishProgress(), ...(data || {}) };
     ensureDailyVocabState(state);
     const daily = state.dailyVocab;
@@ -1702,12 +1705,12 @@ async function deliverScheduledVocabulary(api, fileName) {
     const deliveryMinutes = Number(daily.deliveryHour) * 60 + Number(daily.deliveryMinute);
     if (currentMinutes < deliveryMinutes || daily.lastDeliveredDate === today) return;
 
-    const memoryKey = String(state.ownerKey || fileName.replace(/\.json$/iu, ""));
     const lesson = await generateDailyVocabularyLesson(String(state.threadId), memoryKey, state);
     if (!lesson) return;
     await api.sendMessage({ msg: formatDailyVocabularyLesson(lesson) }, state.threadId, ThreadType.User);
     state.dailyVocab.lastDeliveredDate = today;
     saveEnglishProgress(memoryKey, state);
+    if(cloudReady){await queueEnglishCloudSave(memoryKey,state);await flushEnglishCloudSave(memoryKey);}
     console.log(`[English] Đã gửi bài từ vựng ngày ${today} tới ${state.threadId}`);
   } catch (e) {
     console.error(`[English] Gửi bài tự động thất bại (${fileName}):`, e.message);
@@ -1727,7 +1730,7 @@ function startDailyVocabularyScheduler(api) {
       console.error("[English] Không đọc được thư mục bài hằng ngày:", e.message);
       return;
     }
-    for (const fileName of files) await deliverScheduledVocabulary(api, fileName);
+    for (const fileName of files) await withThreadLock(fileName.replace(/\.json$/iu,''),()=>deliverScheduledVocabulary(api,fileName));
   };
   const timer = setInterval(() => { tick().catch(e => console.error("[English] Scheduler error:", e.message)); }, 30_000);
   timer.unref?.();
@@ -2121,16 +2124,20 @@ function appendResearchSources(reply, sources) {
 }
 
 // ── Gemini API (OpenAI-compatible, multimodal) ───────────────────────────────
+// ── Gemini API (OpenAI-compatible, multimodal) ───────────────────────────────
 async function askGemini(tid, question, senderName = "User", imageBase64 = null, imageMime = "image/jpeg", researchSources = null, memoryKey = tid, options = {}) {
   const history = getHistory(tid);
   const requestedMaxTokens = Number(options.maxTokens);
-  const maxTokens = Number.isFinite(requestedMaxTokens)
-    ? Math.min(1200, Math.max(200, requestedMaxTokens))
-    : GEMINI_MAX_TOKENS;
-
-  const messages = [{ role: "system", content: options.systemPrompt || SYSTEM_PROMPT }];
+  const maxTokens = Number.isFinite(requestedMaxTokens) ? Math.min(1200, Math.max(200, requestedMaxTokens)) : GEMINI_MAX_TOKENS;
+  const messages = [{
+    role: "system",
+    content: options.systemPrompt || SYSTEM_PROMPT
+  }];
   const memoryContext = options.includeMemory === false ? "" : formatMemoryContext(memoryKey, question);
-  if (memoryContext) messages.push({ role: "system", content: memoryContext });
+  if (memoryContext) messages.push({
+    role: "system",
+    content: memoryContext
+  });
   const conversationDigest = getConversationDigest(tid);
   if (conversationDigest) {
     messages.push({
@@ -2139,17 +2146,26 @@ async function askGemini(tid, question, senderName = "User", imageBase64 = null,
     });
   }
   if (options.includeConversationGuidance !== false) {
-    messages.push({ role: "system", content: `TÍN HIỆU HỘI THOẠI (tham khảo): ${conversationGuidance(question)}` });
+    messages.push({
+      role: "system",
+      content: `TÍN HIỆU HỘI THOẠI (tham khảo): ${conversationGuidance(question)}`
+    });
   }
 
   // Add chat history
   for (const turn of history) {
     if (turn.role === "user") {
       const text = (turn.parts || []).map(p => p.text || "").join(" ").trim();
-      if (text) messages.push({ role: "user", content: text });
+      if (text) messages.push({
+        role: "user",
+        content: text
+      });
     } else if (turn.role === "model") {
       const text = (turn.parts || []).map(p => p.text || "").join(" ").trim();
-      if (text) messages.push({ role: "assistant", content: text });
+      if (text) messages.push({
+        role: "assistant",
+        content: text
+      });
     }
   }
 
@@ -2161,52 +2177,45 @@ async function askGemini(tid, question, senderName = "User", imageBase64 = null,
     // OpenAI-compatible multimodal format
     messages.push({
       role: "user",
-      content: [
-        { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
-        { type: "text", text: userMessage || "Mô tả ảnh này đi" }
-      ]
+      content: [{
+        type: "image_url",
+        image_url: {
+          url: `data:${imageMime};base64,${imageBase64}`
+        }
+      }, {
+        type: "text",
+        text: userMessage || "Mô tả ảnh này đi"
+      }]
     });
   } else {
-    messages.push({ role: "user", content: userMessage });
+    messages.push({
+      role: "user",
+      content: userMessage
+    });
   }
-
   const t0 = Date.now();
   try {
     const requestGemini = () => fetch(`${GEMINI_BASE_URL}/chat/completions`, {
       method: "POST",
-      signal: coachStreamContext.getStore()?.signal ? AbortSignal.any([AbortSignal.timeout(55000),coachStreamContext.getStore().signal]) : AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(60000),
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${GEMINI_API_KEY}`,
+        "Authorization": `Bearer ${GEMINI_API_KEY}`
       },
       body: JSON.stringify({
         model: imageBase64 ? GEMINI_VISION_MODEL : GEMINI_MODEL,
         messages: messages,
         max_tokens: maxTokens,
-        stream: Boolean(coachStreamContext.getStore()?.onText),
-      }),
+        stream: false
+      })
     });
-
-    let response=await requestGemini();
-    const streamOptions=coachStreamContext.getStore();
-    const retryHeader=Number(response.headers.get('retry-after'));
-    if(streamOptions?.onText && Date.now()-t0<15000 && (response.status===503 || (response.status===429 && retryHeader>0 && retryHeader<=8))){
-      const delayMs=retryHeader>0?Math.min(8000,retryHeader*1000):2000+Math.floor(Math.random()*600);
-      streamOptions.onStatus?.({phase:'retrying',status:response.status,delayMs});
-      await response.body?.cancel();
-      await waitForRetry(delayMs,undefined,{signal:streamOptions.signal});
-      response=await requestGemini();
-    }
+    let response = await requestGemini();
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       console.error(`[Gemini] HTTP ${response.status}: ${errText.slice(0, 200)}`);
-      if (coachStreamContext.getStore()?.onText) { const error=new Error(`AI upstream HTTP ${response.status}`);error.status=response.status;throw error; }
       return "Đã xảy ra lỗi khi gọi AI. Vui lòng thử lại sau.";
     }
-
-    const data = response.headers.get('content-type')?.includes('text/event-stream')
-      ? await readGeminiStream(response,coachStreamContext.getStore()?.onText)
-      : await response.json();
+    const data = await response.json();
     const elapsed = Date.now() - t0;
     // Try multiple response fields for content
     const choice = data.choices?.[0] || {};
@@ -2220,7 +2229,6 @@ async function askGemini(tid, question, senderName = "User", imageBase64 = null,
     if (!content) {
       console.log(`  [Gemini] Full choice: ${JSON.stringify(choice).slice(0, 500)}`);
     }
-
     let reply = content;
     // If content is empty, the provider content filter may have blocked it
     // Try retrying with a different prompt (avoid the trigger words)
@@ -2232,26 +2240,31 @@ async function askGemini(tid, question, senderName = "User", imageBase64 = null,
       if (sanitized) {
         const retryUserMsg = senderName ? `${senderName}: ${sanitized}` : sanitized;
         // A retry must retain the conversation partner's last question and scenario.
-        const retryMessages = [
-          ...messages.slice(0, -1),
-          { role: "user", content: imageBase64 ? [
-            { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
-            { type: "text", text: retryUserMsg },
-          ] : retryUserMsg },
-        ];
+        const retryMessages = [...messages.slice(0, -1), {
+          role: "user",
+          content: imageBase64 ? [{
+            type: "image_url",
+            image_url: {
+              url: `data:${imageMime};base64,${imageBase64}`
+            }
+          }, {
+            type: "text",
+            text: retryUserMsg
+          }] : retryUserMsg
+        }];
         const retryRes = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
           method: "POST",
           signal: AbortSignal.timeout(60000),
           headers: {
             "Content-Type": "application/json",
-            "Authorization": `Bearer ${GEMINI_API_KEY}`,
+            "Authorization": `Bearer ${GEMINI_API_KEY}`
           },
           body: JSON.stringify({
             model: imageBase64 ? GEMINI_VISION_MODEL : GEMINI_MODEL,
             messages: retryMessages,
             max_tokens: maxTokens,
-            stream: false,
-          }),
+            stream: false
+          })
         });
         if (retryRes.ok) {
           const retryData = await retryRes.json();
@@ -2270,20 +2283,30 @@ async function askGemini(tid, question, senderName = "User", imageBase64 = null,
     // Keep research excerpts out of persistent history. They are temporary
     // grounding for this turn, not part of the user's personal conversation.
     if (options.saveHistory !== false && receivedReply) {
-      history.push({ role: "user", parts: [{ text: currentUserText + (imageBase64 ? " [đã gửi ảnh]" : "") }] });
-      history.push({ role: "model", parts: [{ text: reply }] });
+      history.push({
+        role: "user",
+        parts: [{
+          text: currentUserText + (imageBase64 ? " [đã gửi ảnh]" : "")
+        }]
+      });
+      history.push({
+        role: "model",
+        parts: [{
+          text: reply
+        }]
+      });
       trimAndSave(tid);
     }
     if (receivedReply) options.onReply?.();
-
     return reply;
   } catch (err) {
     const elapsed = Date.now() - t0;
     console.error(`[Gemini] API error sau ${elapsed}ms:`, err.message);
-    if (coachStreamContext.getStore()?.onText) { const error=new Error('Dịch vụ AI tạm thời chưa sẵn sàng. Vui lòng thử lại sau.');error.status=err.status;throw error; }
     return "Đã xảy ra lỗi khi gọi AI. Vui lòng thử lại sau.";
   }
 }
+
+// ── Help text ─────────────────────────────────────────────────────────────────
 
 // ── Help text ─────────────────────────────────────────────────────────────────
 const HELP_TEXT_DM = `=== Ham Si Tơ Bot — DM ===
@@ -3151,22 +3174,37 @@ const coachRuntime = {
       messages: history.slice(state.practiceHistoryId ? 1 : 0).map(turn => ({ role: turn.role === "model" ? "coach" : "learner", text: (turn.parts || []).map(part => part.text || "").join(" ") })),
     };
   },
-  async command(learnerId, text, options = {}) {
-    return coachStreamContext.run(options, async () => {
-    const messages = [];
-    const api = { sendMessage: async payload => { messages.push(String(payload.msg || "")); } };
-    const message = { type: ThreadType.User, threadId: learnerId, data: { uidFrom: learnerId, dName: "Learner" } };
-    // Web requests must report failures instead of converting lock errors into a successful empty lesson.
-    let commandError;
-    const handled = await withThreadLock(learnerId, async () => {
-      try { return await handleEnglishCommandLocal(api, message, text); }
-      catch (error) { commandError = error; }
-    });
-    if (commandError) throw commandError;
-    if (!handled && !messages.length) messages.push("Chọn một tình huống để bắt đầu buổi luyện trước nhé.");
-    return { ...this.snapshot(learnerId), notifications: messages };
-    });
-  },
+  async command(learnerId, text) {
+  const messages = [];
+  const api = {
+    sendMessage: async payload => {
+      messages.push(String(payload.msg || ""));
+    }
+  };
+  const message = {
+    type: ThreadType.User,
+    threadId: learnerId,
+    data: {
+      uidFrom: learnerId,
+      dName: "Learner"
+    }
+  };
+  // Web requests must report failures instead of converting lock errors into a successful empty lesson.
+  let commandError;
+  const handled = await withThreadLock(learnerId, async () => {
+    try {
+      return await handleEnglishCommandLocal(api, message, text);
+    } catch (error) {
+      commandError = error;
+    }
+  });
+  if (commandError) throw commandError;
+  if (!handled && !messages.length) messages.push("Chọn một tình huống để bắt đầu buổi luyện trước nhé.");
+  return {
+    ...this.snapshot(learnerId),
+    notifications: messages
+  };
+},
 };
 
 export { coachRuntime };

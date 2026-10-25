@@ -4,8 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { coachStreamContext } from "../english/gemini-streaming.mjs";
 import * as learning from "../english/english-learning.mjs";
+import { withRevision, PROFILE_REVISION } from '../vendor/noi-profile-store/profile-merge.mjs';
 
 // Exercise the existing single-file bot without loading .env, logging in to Zalo,
 // starting schedulers or calling external services. Only HTTP responses are mocked.
@@ -25,15 +25,16 @@ function createCoach(t, env = {}) {
   const messages = [];
   const requests = [];
   const responses = [];
+  const errors=[];
   const context = vm.createContext({
-    ...learning, coachStreamContext, createWebPairingCode: () => "TESTCODE",
+    ...learning, withRevision, createWebPairingCode: () => "TESTCODE",
     isEnglishCloudConfigured: () => false,
     loadEnglishCoachProfile: async () => null,
     saveEnglishCoachProfile: async () => {},
     fs, path, Buffer, AbortSignal,
     http: {}, net: {}, WebSocket: class {}, nodemailer: {}, Zalo: class {},
     Reactions: {}, ThreadType: { User: 0, Group: 1 }, dotenv: { config() {} },
-    console: { log() {}, warn() {}, error() {} },
+    console: { log() {}, warn() {}, error(...args) {errors.push(args.join(' '));} },
     process: {
       env: {
         GEMINI_API_KEY: "test-placeholder", RATE_LIMIT_ENABLED: "false",
@@ -65,7 +66,14 @@ function createCoach(t, env = {}) {
   const api = { sendMessage: async payload => messages.push(payload.msg) };
   const message = { threadId: "learner-1", type: 0, data: { uidFrom: "learner-1" } };
   return {
-    ...context.coach, messages, requests, responses,
+    ...context.coach, messages, requests, responses, errors,
+    enableCloud(profile){
+      let stored=profile;const saves=[];
+      context.isEnglishCloudConfigured=()=>true;
+      context.loadEnglishCoachProfile=async()=>withRevision(JSON.parse(JSON.stringify(stored)),String(saves.length));
+      context.saveEnglishCoachProfile=async(_id,payload,previous)=>{assert(previous[PROFILE_REVISION]!==undefined);saves.push(payload);stored=withRevision(JSON.parse(JSON.stringify(payload)),String(saves.length));return stored;};
+      return {saves,read:()=>stored};
+    },
     send: (text, user = "learner-1", type = 0) => context.coach.handleEnglishCommand(
       api, { ...message, threadId: user, type, data: { uidFrom: user } }, text
     ),
@@ -73,6 +81,18 @@ function createCoach(t, env = {}) {
     deliverVocabulary: () => context.coach.deliverScheduledVocabulary(api, "learner-1.json"),
   };
 }
+
+test('cloud commands save once and use the loaded profile revision',async t=>{
+  const coach=createCoach(t);
+  const cloud=coach.enableCloud({progress:coach.state(),history:[]});
+  await coach.send('/english goal Communication at work');
+  assert.equal(cloud.saves.length,1);
+  assert.equal(cloud.read().progress.learning.goal,'Communication at work');
+  await coach.send('/english time 20');
+  assert.equal(cloud.saves.length,2);
+  assert.equal(cloud.read().progress.learning.minutesPerDay,20);
+  assert.deepEqual(coach.errors,[]);
+});
 
 test("a serverless POSIX timezone does not prevent lessons from starting", async t => {
   const coach = createCoach(t, { TZ: ":UTC" });
@@ -261,6 +281,8 @@ test("scheduled vocabulary delivery preserves the active conversation and runs o
   };
   coach.saveEnglishProgress("learner-1", state);
   await coach.deliverVocabulary();
+  assert.deepEqual(coach.errors,[]);
+  assert.equal(coach.state().dailyVocab.lastDeliveredDate,coach.localDateKey());
   await coach.deliverVocabulary();
   assert.equal(coach.messages.length, 2);
   assert.equal(coach.requests.length, 0);

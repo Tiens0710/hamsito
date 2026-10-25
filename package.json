@@ -5,7 +5,8 @@
   "main": "bot.mjs",
   "scripts": {
     "start": "node bot.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "sync:core": "node scripts/sync-profile-store.mjs"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

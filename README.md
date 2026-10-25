@@ -254,6 +254,24 @@ Dùng /english game hoặc /english report để xem XP, level, streak, thành t
 Mỗi người dùng có file tiến độ riêng theo UID Zalo, gồm nhật ký session, nên XP, quiz và lịch sử AI
 không bị trộn giữa các tài khoản.
 
+## Core dùng chung và cập nhật
+
+Bot không giữ bản sao thư viện từ vựng, TOEIC hoặc giao diện web. Luật ghi nhận
+tiến độ và adapter Supabase được ghim từ repo web trong `vendor/noi-profile-store/`.
+`manifest.json` ghi commit nguồn và SHA-256 của từng file; không sửa trực tiếp các file vendor.
+
+Sau khi duyệt một commit core mới trong repo web, cập nhật bằng:
+
+```sh
+npm run sync:core -- <full-web-commit-sha>
+npm test
+```
+
+Script dùng đăng nhập GitHub hiện có để lấy đúng commit; không cần đưa token vào code.
+`npm ci` và `npm start` dùng dependency đã ghim trong repo, không tự tải mã nguồn mới.
+Core lưu hồ sơ có kiểm tra phiên bản và giữ các thay đổi độc lập khi Zalo và web cùng ghi.
+Ngữ cảnh bộ từ và nhiệm vụ được chuyển qua hồ sơ chung, không cần chép thư viện vào bot.
+
 ## License
 
 MIT
