@@ -1,5 +1,5 @@
 import { Zalo, ThreadType, Reactions } from "zca-js";
-import { coachStreamContext, readGeminiStream } from './gemini-streaming.mjs';
+import { coachStreamContext, readGeminiStream } from './english/gemini-streaming.mjs';
 import { setTimeout as waitForRetry } from 'node:timers/promises';
 import fs from "fs";
 import path from "path";
@@ -9,12 +9,8 @@ import dotenv from "dotenv";
 import WebSocket from "ws";
 import nodemailer from "nodemailer";
 import { pathToFileURL } from "node:url";
-import { ensureLearningState, ENGLISH_TRACKING_FORMAT, parseEnglishLearningReply, recordEnglishLearning, learningContext, getLearningSnapshot, reviewLearningCard } from "./english-learning.mjs";
-import { VOCABULARY_SETS, vocabularyAction, vocabularyReadingPrompt, appendVocabularyReading } from './english-vocabulary.mjs';
-import { updateDailyMission } from './english-daily-mission.mjs';
-import { toeicAction } from './english-toeic-path.mjs';
-import { createWebPairingCode } from "./coach-pairing.mjs";
-import { createSharedPairingCode, isEnglishCloudConfigured, loadEnglishCoachProfile, saveEnglishCoachProfile } from "./english-cloud-store.mjs";
+import { ensureLearningState, ENGLISH_TRACKING_FORMAT, parseEnglishLearningReply, recordEnglishLearning, learningContext, getLearningSnapshot, reviewLearningCard } from "./english/english-learning.mjs";
+import { createSharedPairingCode, isEnglishCloudConfigured, loadEnglishCoachProfile, saveEnglishCoachProfile } from "./english/english-cloud-store.mjs";
 
 dotenv.config();
 
@@ -1567,10 +1563,12 @@ async function handleEnglishCommandLocal(api, message, rawText) {
     return true;
   }
   if (lowerArgs === "web") {
-    const code = isEnglishCloudConfigured()
-      ? await createSharedPairingCode(memoryKey)
-      : createWebPairingCode(memoryKey);
-    await api.sendMessage({ msg: `Mã nối hồ sơ học: ${code}\nMở mục Thiết lập trên bản web và nhập mã này trong 10 phút. Mã chỉ dùng được một lần.`, quote: message.data }, message.threadId, message.type);
+    if (!isEnglishCloudConfigured()) {
+      await api.sendMessage({ msg: 'Để nối hồ sơ với web Nói, hãy cấu hình Supabase cho bot và web dùng chung database trước.', quote: message.data }, message.threadId, message.type);
+      return true;
+    }
+    const code = await createSharedPairingCode(memoryKey);
+    await api.sendMessage({ msg: `Mã nối hồ sơ học: ${code}\nMở https://noi-english-coach.vercel.app/#settings và nhập mã này trong 10 phút. Mã chỉ dùng được một lần.`, quote: message.data }, message.threadId, message.type);
     return true;
   }
   if (lowerArgs === "cards" || /^card(?:\s|$)/i.test(args)) {
@@ -3105,11 +3103,6 @@ async function main() {
   loadAutoFriendRequests();
   loadReminders();
 
-  if (ENGLISH_COACH_ENABLED && process.env.ENGLISH_WEB_ENABLED !== "false") {
-    const { startCoachWebServer } = await import("./coach-web-server.mjs");
-    await startCoachWebServer(coachRuntime);
-  }
-
   const api = await getApi();
   try {
     BOT_UID = String(api.getOwnId?.() || "").trim();
@@ -3173,61 +3166,6 @@ const coachRuntime = {
     if (!handled && !messages.length) messages.push("Chọn một tình huống để bắt đầu buổi luyện trước nhé.");
     return { ...this.snapshot(learnerId), notifications: messages };
     });
-  },
-  async toeic(learnerId, body) {
-    let failure,result;
-    await withThreadLock(learnerId,()=>{
-      try {
-        const state=loadEnglishProgress(learnerId);ensureLearningState(state);
-        result=toeicAction(state,body);
-        saveEnglishProgress(learnerId,state);
-      }catch(error){failure=error;}
-    });
-    if(failure)throw failure;
-    return result;
-  },
-  async mission(learnerId, action, index) {
-    let failure;
-    await withThreadLock(learnerId,()=>{
-      try {
-        const state=loadEnglishProgress(learnerId);
-        const learning=getLearningSnapshot(state);
-        updateDailyMission(state,learning.recommended,action,index);
-        saveEnglishProgress(learnerId,state);
-      } catch(error){failure=error;}
-    });
-    if(failure) throw failure;
-  },
-  async reviewCard(learnerId, cardId, rating) {
-    let error;
-    await withThreadLock(learnerId, () => {
-      try {
-        const state = loadEnglishProgress(learnerId);
-        reviewLearningCard(state, cardId, rating);
-        saveEnglishProgress(learnerId, state);
-      } catch (caught) { error = caught; }
-    });
-    if (error) throw error;
-    return this.snapshot(learnerId);
-  },
-  async vocabulary(learnerId, body) {
-    let failure, result;
-    await withThreadLock(learnerId, async () => {
-      try {
-        const state=loadEnglishProgress(learnerId);
-        if(body.action==='generate') {
-          if(!this.configured||!this.enabled)throw new Error('Trợ lý AI chưa sẵn sàng. Bạn vẫn có thể học các bài đã có.');
-          const prompt=vocabularyReadingPrompt(state,body.setId,body.level);
-          const wordCount=VOCABULARY_SETS.find(set=>set.id===body.setId).words.length;
-          const raw=await askGemini(`english-vocabulary:${learnerId}`,prompt,'',null,null,null,learnerId,{systemPrompt:'You write accurate educational JSON. Follow the schema and use every requested vocabulary gap exactly once.',maxTokens:Math.min(2800,1200+Math.max(0,wordCount-8)*100),includeMemory:false,includeConversationGuidance:false,saveHistory:false});
-          result=appendVocabularyReading(state,body.setId,body.level,raw);
-        } else result=vocabularyAction(state,body);
-        saveEnglishProgress(learnerId,state);
-      } catch(error) { failure=error; }
-    });
-    if(failure)throw failure;
-    if(!result)throw new Error('Bài học đang bận. Thử lại sau nhé.');
-    return {result,...this.snapshot(learnerId)};
   },
 };
 

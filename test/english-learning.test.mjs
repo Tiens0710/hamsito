@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ensureLearningState, parseEnglishLearningReply, recordEnglishLearning, reviewLearningCard, getLearningSnapshot } from "../english-learning.mjs";
+import { ensureLearningState, parseEnglishLearningReply, recordEnglishLearning, reviewLearningCard, getLearningSnapshot } from "../english/english-learning.mjs";
 
 test("only corrections quoted from the learner and phrases used in the conversation are kept", () => {
   const turn = parseEnglishLearningReply(JSON.stringify({ reply: "A latte? Sure. What size would you like?", correction: { original: "I want coffee", corrected: "I'd like a coffee", reason: "Lịch sự hơn", skill: "clarity" }, phrases: [{ english: "What size would you like?", vietnamese: "Bạn muốn cỡ nào?" }, { english: "Invented phrase", vietnamese: "Không hề xuất hiện" }] }), "I want coffee");

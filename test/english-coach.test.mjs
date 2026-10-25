@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import * as learning from "../english-learning.mjs";
+import { coachStreamContext } from "../english/gemini-streaming.mjs";
+import * as learning from "../english/english-learning.mjs";
 
 // Exercise the existing single-file bot without loading .env, logging in to Zalo,
 // starting schedulers or calling external services. Only HTTP responses are mocked.
@@ -25,7 +26,7 @@ function createCoach(t, env = {}) {
   const requests = [];
   const responses = [];
   const context = vm.createContext({
-    ...learning, createWebPairingCode: () => "TESTCODE",
+    ...learning, coachStreamContext, createWebPairingCode: () => "TESTCODE",
     isEnglishCloudConfigured: () => false,
     loadEnglishCoachProfile: async () => null,
     saveEnglishCoachProfile: async () => {},
@@ -50,6 +51,7 @@ function createCoach(t, env = {}) {
       if (response.throws) throw new Error("Simulated network failure");
       return {
         ok: response.ok !== false, status: response.status || 200,
+        headers: new Headers({ "content-type": "application/json" }),
         text: async () => "Simulated API error",
         json: async () => ({ choices: [{ message: { content: response.content ?? "" } }] }),
       };
@@ -64,7 +66,6 @@ function createCoach(t, env = {}) {
   const message = { threadId: "learner-1", type: 0, data: { uidFrom: "learner-1" } };
   return {
     ...context.coach, messages, requests, responses,
-    failCloud: value => { context.isEnglishCloudConfigured = () => { if (value) throw new Error("Cloud unavailable"); return false; }; },
     send: (text, user = "learner-1", type = 0) => context.coach.handleEnglishCommand(
       api, { ...message, threadId: user, type, data: { uidFrom: user } }, text
     ),
@@ -81,16 +82,23 @@ test("a serverless POSIX timezone does not prevent lessons from starting", async
   assert.match(result.messages[0].text, /Nice to meet you/);
 });
 
-test("web lesson opens a session and surfaces command failures without blocking the next request", async t => {
+test("English runtime releases the processing lock after a failed command", async t => {
   const coach = createCoach(t);
-  coach.failCloud(true);
-  await assert.rejects(coach.runtime.command("learner-1", "/english lesson cafe"), /Cloud unavailable/);
-  coach.failCloud(false);
+  const invalidInput = { toString() { throw new Error("Invalid command input"); } };
+  await assert.rejects(coach.runtime.command("learner-1", invalidInput), /Invalid command input/);
   const result = await coach.runtime.command("learner-1", "/english lesson cafe");
   assert.equal(result.session.active, true);
   assert.equal(result.session.topic, "cafe");
   assert.match(result.notifications[0], /Welcome! What would you like to order/);
   assert.equal(result.messages.length, 1);
+});
+
+test("pairing with the separate web app requires shared cloud storage", async t => {
+  const coach = createCoach(t);
+  await coach.send("/english web");
+  assert.equal(coach.messages.length, 1);
+  assert.match(coach.messages[0], /Supabase/);
+  assert.equal(coach.requests.length, 0);
 });
 
 test("the first learner answer follows the saved opening in the assigned role", async t => {

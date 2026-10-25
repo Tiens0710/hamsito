@@ -168,68 +168,31 @@ Bot chỉ tự động ghi nhớ những thông tin được nói rõ theo dạn
 Lịch sử cũ được nén thành context digest để giảm kích thước prompt; cache runtime cũng
 được tự động dọn sau thời gian không hoạt động.
 
+## Ranh giới dự án
+
+Repo này chỉ chạy bot Zalo bằng `npm start`. Giao diện web, API HTTP/WebSocket,
+tài nguyên hình ảnh và cấu hình Vercel nằm ở repo riêng:
+https://github.com/Tiens0710/noi-english-coach.
+
+- `bot.mjs`: đăng nhập Zalo, xử lý tin nhắn và các lệnh bot.
+- `english/`: các module học và dữ liệu học dùng cho ngữ cảnh English Coach của bot.
+- `scripts/`: công cụ cấu hình cục bộ.
+- `test/`: kiểm tra English Coach và tiến độ học, chạy bằng `npm test`.
+
 ## English Coach (DM)
 
-English Coach có hai giao diện dùng chung hồ sơ: Zalo và web **Nói**. Hồ sơ lưu mục tiêu,
-thời lượng, các lỗi có dẫn chứng từ câu đã gửi và mẫu câu thực sự dùng trong hội thoại.
-Trợ lý lấy ngữ cảnh này ở buổi sau để gợi dùng lại các câu cần ôn. Không kết luận điểm yếu
-khi chưa có dữ liệu, không chấm phát âm từ tin nhắn chữ.
+Bot và web Nói có thể dùng chung hồ sơ qua Supabase. Đặt `SUPABASE_URL` và
+`SUPABASE_SECRET_KEY` riêng trong môi trường máy chủ của cả hai ứng dụng.
+Schema database được quản lý trong thư mục `supabase/migrations/` của repo web.
+Để ghép hồ sơ, nhắn `/english web` cho bot rồi nhập mã một lần tại
+https://noi-english-coach.vercel.app/#settings. Mã hết hạn sau 10 phút.
+Khi chưa cấu hình cloud, bot vẫn luyện hội thoại với hồ sơ cục bộ;
+ghép hồ sơ giữa hai ứng dụng yêu cầu database chung.
 
-### Mở bản web
-
-```bash
-npm install
-npm run web
-```
-
-Mở `http://127.0.0.1:3210`. Bản web có tổng quan, luyện hội thoại, 10 tình huống giao tiếp,
-lộ trình theo mục tiêu, sổ tay ôn câu và thiết lập. `npm run web` chỉ mở web, không đăng nhập Zalo.
-`npm start` mở cả web lẫn bot trong cùng tiến trình, dùng chung hàng đợi xử lý và dữ liệu.
-Dừng bản web độc lập trước khi dùng `npm start`, vì hai chế độ sử dụng cùng một cổng.
-Có thể đổi `ENGLISH_WEB_PORT`, hoặc đặt `ENGLISH_WEB_ENABLED=false` để chạy riêng bot.
-Bản chạy cục bộ chỉ lắng nghe ở localhost; bản online được phục vụ qua Vercel.
-
-### Triển khai bản web lên Vercel
-
-Vercel phục vụ giao diện tĩnh và API Node.js trong `api/`. Tiến độ và lịch sử luyện tiếng Anh được lưu trong Supabase để không phụ thuộc filesystem tạm của function; bot Zalo và web dùng cùng các biến `SUPABASE_URL` và `SUPABASE_SECRET_KEY` ở môi trường máy chủ. Chạy nội dung `supabase/migrations/20261022000100_english_coach.sql` một lần trong SQL Editor của Supabase trước khi mở app.
-
-Trong Vercel, đặt `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `ENGLISH_WEB_ACCESS_PASSWORD` và `ENGLISH_WEB_SESSION_SECRET` cho Production. Tạo session secret ngẫu nhiên tối thiểu 32 ký tự. Mật khẩu web bảo vệ trang và các API gọi Gemini; cookie đăng nhập được ký, HttpOnly, SameSite=Strict và Secure. Chỉ giữ khóa Supabase/Gemini ở biến môi trường server-side, không đặt tiền tố `NEXT_PUBLIC_` và không đưa vào mã frontend. Thêm cùng hai biến Supabase vào `.env` của máy chạy bot để đồng bộ dữ liệu Zalo; khi cấu hình, `/english web` tạo mã ghép nối một lần và web dùng mã đó để mở đúng hồ sơ.
-
-Để dùng AI cần thêm `GEMINI_API_KEY` hợp lệ vào `.env`, rồi khởi động lại tiến trình đang chạy.
-Khóa được giữ ở máy chủ. Nếu thiếu khóa hoặc API lỗi, trang hiển thị thông báo; không giả lập
-phản hồi AI hay tạo sẵn điểm số. Chọn mức A1–C1 trong thiết lập là tự chọn mức luyện, không
-phải chứng nhận trình độ. Tiến độ “đã luyện” là số lượt tương tác, không đo độ thành thạo.
-
-Nút nghe dùng giọng đọc của trình duyệt. Micro dùng SpeechRecognition nếu trình duyệt hỗ trợ,
-chuyển tiếng Anh thành chữ để người học xem lại trước khi gửi; không tự gửi bản nhận diện.
-Chrome/Edge hỗ trợ tùy máy và dịch vụ nhận diện có thể cần mạng. Chưa có đánh giá phát âm,
-hội thoại âm thanh trực tiếp hay Gemini Live trong tính năng này.
-
-### Nối hồ sơ Zalo và web
-
-Nhắn `/english web` cho bot trong DM, rồi mở **Thiết lập → Web + Zalo** và nhập mã 8 ký tự.
-Mã hết hạn sau 10 phút và chỉ dùng được một lần. Khi nối, web chuyển sang đúng hồ sơ Zalo;
-hồ sơ web riêng vẫn được giữ và có thể quay lại bằng nút **Về hồ sơ web riêng**.
-Cookie được ký, HttpOnly và SameSite=Strict; API không nhận UID tùy ý từ giao diện.
-Các file hồ sơ, cookie secret và mã kết nối nằm trong `data/`, đã được Git bỏ qua.
-
-### Lộ trình và ôn câu cá nhân
-
-```text
-/english goal Giao tiếp công việc và trao đổi với đồng nghiệp
-/english time 15
-/english plan
-/english today
-/english cards
-/english card show
-/english card good
-/english card again
-```
-
-`today` chọn tình huống tiếp theo dựa trên mục tiêu và lượt đã luyện. Sau hội thoại, trợ lý
-lưu tối đa một lỗi có trích dẫn từ câu của người học và hai mẫu câu vừa dùng. `cards` gợi ý
-nghĩa tiếng Việt để tự nhớ lại; `card show` hiện câu tham khảo. Người học tự đánh dấu đã nhớ
-hoặc cần ôn: câu đã nhớ quay lại sau 1, 3, 7, 14, 30 ngày; chưa nhớ được ôn lại sau 10 phút.
+Hồ sơ giữ mục tiêu, thời lượng, các lỗi có dẫn chứng từ câu đã gửi và mẫu câu
+thực sự xuất hiện trong hội thoại. Lệnh `/english goal`, `/english time`,
+`/english plan`, `/english today` và `/english cards` hỗ trợ luyện theo mục tiêu và ôn lại.
+Các dữ liệu học của web được giữ nguyên khi bot cập nhật hồ sơ chung.
 
 ### Các lệnh luyện hội thoại
 
@@ -290,30 +253,6 @@ XP vẫn được lưu để xem trong báo cáo, không xuất hiện sau mỗi
 Dùng /english game hoặc /english report để xem XP, level, streak, thành tựu và 3 session gần nhất.
 Mỗi người dùng có file tiến độ riêng theo UID Zalo, gồm nhật ký session, nên XP, quiz và lịch sử AI
 không bị trộn giữa các tài khoản.
-
-### Từ vựng trên web
-
-Mở mục **Từ vựng** (`#vocabulary`) để học các bộ từ giao tiếp. Bản hiện tại có 40 bộ
-với 300 mục từ; nội dung được biên soạn riêng cho Nói.
-
-- Thẻ từ có nghĩa, phiên âm, từ loại, ví dụ và bản dịch; hỗ trợ lật thẻ, đánh dấu sao,
-  lọc từ chưa nhớ/đến hạn và xáo trộn.
-- Luyện nhớ bằng cách gõ từ tiếng Anh từ nghĩa tiếng Việt hoặc chọn trong 4 đáp án.
-- Bài đọc dùng lại từ trong bộ: điền trực tiếp trong đoạn, gợi nghĩa tùy chọn, ngân hàng
-  từ, nghe/dịch từng câu và câu hỏi hiểu nội dung. Máy chủ chấm bài và lưu lịch sử.
-- Nghe chép từng từ hoặc cả câu ví dụ bằng giọng tiếng Anh có sẵn trong trình duyệt;
-  có tốc độ đọc và phím Ctrl/Command + Enter để nghe lại. Không chấm điểm phát âm.
-- Nút **Luyện nói bộ từ này** mở đúng tình huống và đưa bộ từ vào ngữ cảnh của trợ lý.
-
-Tiến độ và bài đọc đang làm được lưu trong `learning.vocabulary` của hồ sơ hiện có,
-bao gồm Supabase khi đã cấu hình. Không cần migration hoặc biến môi trường mới.
-Các thao tác dùng `POST /api/vocabulary`, cùng cơ chế xác thực và kiểm tra Origin
-của ứng dụng. Đáp án được chấm tại máy chủ; ký tự hoa và dấu câu không ảnh hưởng kết quả.
-
-Ví dụ đường dẫn: `?set=cafe&mode=reading#vocabulary`. Ngoài các bài biên soạn sẵn,
-trong **Tuỳ chọn** của bài đọc có thể chọn mức A1–C1 và tạo bài mới bằng Gemini.
-Máy chủ kiểm tra cấu trúc, đủ 8 từ đúng trong bộ, và lưu tối đa 10 bài AI cho mỗi bộ.
-Nếu AI trả nội dung không hợp lệ, bài mới sẽ không được lưu và ứng dụng báo để thử lại.
 
 ## License
 
